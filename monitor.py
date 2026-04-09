@@ -15,7 +15,6 @@ from pathlib import Path
 
 import serial
 
-LOG_FILE = "uart.log"
 RECONNECT_ATTEMPTS = 5
 RECONNECT_INTERVAL = 1.0
 
@@ -83,8 +82,13 @@ def read_thread(ser: serial.Serial, log_file, stop_event: threading.Event) -> No
         log_file.flush()
 
 
-def input_loop(ser: serial.Serial, stop_event: threading.Event) -> None:
-    """メインスレッドのキー入力ループ: 入力をデバイスに送信する。"""
+def input_loop(ser: serial.Serial, stop_event: threading.Event) -> bool:
+    """メインスレッドのキー入力ループ: 入力をデバイスに送信する。
+
+    Returns:
+        True  — Ctrl+C によるユーザー終了
+        False — stop_event が外部（切断検知）によってセットされた
+    """
     while not stop_event.is_set():
         if not msvcrt.kbhit():
             time.sleep(0.01)
@@ -95,7 +99,7 @@ def input_loop(ser: serial.Serial, stop_event: threading.Event) -> None:
         if ch == "\x03":
             # Ctrl+C
             stop_event.set()
-            break
+            return True
 
         if ch in ("\r", "\n"):
             # Enter キー: デバイスに \r\n を送信、ターミナルに改行をエコー
@@ -109,50 +113,72 @@ def input_loop(ser: serial.Serial, stop_event: threading.Event) -> None:
             sys.stdout.write(ch)
             sys.stdout.flush()
 
+    # stop_event が外部によってセットされた（切断検知）
+    return False
+
+
+def new_log_path(log_format: str) -> Path:
+    return Path(datetime.now().strftime(log_format))
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="UART共有モニタリングツール")
     parser.add_argument("--port", default="COM3", help="シリアルポート (default: COM3)")
     parser.add_argument("--baud", type=int, default=115200, help="ボーレート (default: 115200)")
+    parser.add_argument(
+        "--log-format",
+        default="%Y-%m-%d_%H%M%S.log",
+        help="ログファイル名のフォーマット（strftime形式, default: %%Y-%%m-%%d_%%H%%M%%S.log）",
+    )
     args = parser.parse_args()
 
-    log_path = Path(LOG_FILE)
+    print(f"[uart_monitor] Connecting to {args.port} @ {args.baud} baud ...")
+    print("[uart_monitor] Press Ctrl+C to exit.")
 
-    try:
-        ser = open_serial(args.port, args.baud)
-    except serial.SerialException as e:
-        print(f"[uart_monitor] ポートを開けません: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    with open(log_path, "a", encoding="utf-8") as log_file:
-        # セッション開始の区切り線をログに書き込む
-        session_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_file.write(f"========== Session Start: {session_start} ==========\n")
-        log_file.flush()
-
-        print(f"[uart_monitor] Connected to {args.port} @ {args.baud} baud")
-        print(f"[uart_monitor] Logging to: {log_path.resolve()}")
-        print("[uart_monitor] Press Ctrl+C to exit.")
-
-        stop_event = threading.Event()
-
-        reader = threading.Thread(
-            target=read_thread,
-            args=(ser, log_file, stop_event),
-            daemon=True,
-        )
-        reader.start()
-
+    while True:
         try:
-            input_loop(ser, stop_event)
-        except KeyboardInterrupt:
-            stop_event.set()
-        finally:
-            stop_event.set()
-            reader.join(timeout=2.0)
-            if ser.is_open:
-                ser.close()
+            ser = connect_with_retry(args.port, args.baud)
+        except serial.SerialException as e:
+            print(f"[uart_monitor] ポートを開けません: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        log_path = new_log_path(args.log_format)
+
+        with open(log_path, "a", encoding="utf-8") as log_file:
+            session_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_file.write(f"========== Session Start: {session_start} ==========\n")
+            log_file.flush()
+
+            print(f"[uart_monitor] Connected to {args.port} @ {args.baud} baud")
+            print(f"[uart_monitor] Logging to: {log_path.resolve()}")
+
+            stop_event = threading.Event()
+
+            reader = threading.Thread(
+                target=read_thread,
+                args=(ser, log_file, stop_event),
+                daemon=True,
+            )
+            reader.start()
+
+            try:
+                user_exit = input_loop(ser, stop_event)
+            except KeyboardInterrupt:
+                stop_event.set()
+                user_exit = True
+            finally:
+                stop_event.set()
+                reader.join(timeout=2.0)
+                if ser.is_open:
+                    ser.close()
+
+        if user_exit:
             print("\r[uart_monitor] Disconnected.")
+            break
+
+        # デバイス切断による再接続
+        print("[uart_monitor] デバイスの再接続を待機しています...")
+        time.sleep(RECONNECT_INTERVAL)
 
 
 if __name__ == "__main__":
