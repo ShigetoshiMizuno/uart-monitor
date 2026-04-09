@@ -1,0 +1,5 @@
+uart.log
+__pycache__/
+*.pyc
+*.pyo
+.env
