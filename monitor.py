@@ -19,7 +19,7 @@ _CTRL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 import serial
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 RECONNECT_ATTEMPTS = 5
 RECONNECT_INTERVAL = 1.0
@@ -44,10 +44,12 @@ def connect_with_retry(port: str, baud: int) -> serial.Serial:
 
 def read_thread(
     ser: serial.Serial,
-    log_file,
+    log_file_holder,
     stop_event: threading.Event,
     udp_sock=None,
     last_udp_sender=None,
+    magic_word="",
+    log_format="",
 ) -> None:
     """シリアル受信スレッド: 受信データをターミナルとログに出力する。"""
     buffer = b""
@@ -74,14 +76,38 @@ def read_thread(
                 line_text = _CTRL_CHARS.sub("", buffer.decode("utf-8", errors="replace").rstrip("\r\n"))
                 buffer = b""
 
+            # マジックワード検知
+            if magic_word and magic_word in line_text:
+                # 1. 現在のログにマジックワード行を書き込む
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                log_file_holder[0].write(f"[{timestamp}] {line_text}\n")
+                log_file_holder[0].flush()
+                log_file_holder[0].close()
+
+                # 2. 新しいログファイルを開く
+                new_path = new_log_path(log_format)
+                new_file = open(new_path, "a", encoding="utf-8")
+                session_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                new_file.write(f"========== Session Start: {session_start} ==========\n")
+                new_file.flush()
+                log_file_holder[0] = new_file
+
+                # 3. ターミナルに通知
+                print(f"\r[uart_monitor] Magic word detected. Rotating log -> {new_path}", flush=True)
+
+                # 4. stdout にも行を表示して次のループへ
+                sys.stdout.write(line_text + "\n")
+                sys.stdout.flush()
+                continue  # 通常の stdout/log 書き込みをスキップ
+
             # ターミナルにタイムスタンプなしで出力
             sys.stdout.write(line_text + "\n")
             sys.stdout.flush()
 
             # ログファイルにタイムスタンプ付きで出力
             timestamp = datetime.now().strftime("%H:%M:%S")
-            log_file.write(f"[{timestamp}] {line_text}\n")
-            log_file.flush()
+            log_file_holder[0].write(f"[{timestamp}] {line_text}\n")
+            log_file_holder[0].flush()
 
             # 最後に UDP コマンドを送ってきたアドレスに返送する
             if udp_sock is not None and last_udp_sender is not None and last_udp_sender[0] is not None:
@@ -96,13 +122,13 @@ def read_thread(
         sys.stdout.write(line_text + "\n")
         sys.stdout.flush()
         timestamp = datetime.now().strftime("%H:%M:%S")
-        log_file.write(f"[{timestamp}] {line_text}\n")
-        log_file.flush()
+        log_file_holder[0].write(f"[{timestamp}] {line_text}\n")
+        log_file_holder[0].flush()
 
 
 def udp_thread(
     ser: serial.Serial,
-    log_file,
+    log_file_holder,
     stop_event: threading.Event,
     udp_port: int,
     udp_sock,
@@ -127,8 +153,8 @@ def udp_thread(
             print(f"[UDP->] {printable.rstrip()}", flush=True)
 
             timestamp = datetime.now().strftime("%H:%M:%S")
-            log_file.write(f"[{timestamp}] [UDP->] {printable.rstrip()}\n")
-            log_file.flush()
+            log_file_holder[0].write(f"[{timestamp}] [UDP->] {printable.rstrip()}\n")
+            log_file_holder[0].flush()
     finally:
         pass  # ソケットのクローズは main() で行う
 
@@ -203,10 +229,17 @@ def main() -> None:
         default=5555,
         help="UDP リッスンポート (default: 5555、0 で無効化)",
     )
+    parser.add_argument(
+        "--magic-word",
+        default="",
+        help="デバイスがこの文字列を送信したらログファイルを切り替える (default: 無効)",
+    )
     args = parser.parse_args()
 
     print(f"[uart_monitor] Connecting to {args.port} @ {args.baud} baud ...")
     print("[uart_monitor] Press Ctrl+C to exit.")
+    if args.magic_word:
+        print(f'[uart_monitor] Magic word: "{args.magic_word}" (triggers log rotation)')
 
     last_udp_sender = [None]  # [addr] or [None]
 
@@ -225,7 +258,9 @@ def main() -> None:
 
         log_path = new_log_path(args.log_format)
 
-        with open(log_path, "a", encoding="utf-8") as log_file:
+        log_file = open(log_path, "a", encoding="utf-8")
+        log_file_holder = [log_file]
+        try:
             session_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             log_file.write(f"========== Session Start: {session_start} ==========\n")
             log_file.flush()
@@ -240,7 +275,8 @@ def main() -> None:
 
             reader = threading.Thread(
                 target=read_thread,
-                args=(ser, log_file, stop_event, udp_sock, last_udp_sender),
+                args=(ser, log_file_holder, stop_event, udp_sock, last_udp_sender,
+                      args.magic_word, args.log_format),
                 daemon=True,
             )
             reader.start()
@@ -249,7 +285,7 @@ def main() -> None:
             if args.udp_port != 0:
                 udp_worker = threading.Thread(
                     target=udp_thread,
-                    args=(ser, log_file, stop_event, args.udp_port, udp_sock, last_udp_sender),
+                    args=(ser, log_file_holder, stop_event, args.udp_port, udp_sock, last_udp_sender),
                     daemon=True,
                 )
                 udp_worker.start()
@@ -259,15 +295,16 @@ def main() -> None:
             except KeyboardInterrupt:
                 stop_event.set()
                 user_exit = True
-            finally:
-                stop_event.set()
-                reader.join(timeout=2.0)
-                if udp_worker is not None:
-                    udp_worker.join(timeout=2.0)
-                if udp_sock is not None:
-                    udp_sock.close()
-                if ser.is_open:
-                    ser.close()
+        finally:
+            stop_event.set()
+            reader.join(timeout=2.0)
+            if udp_worker is not None:
+                udp_worker.join(timeout=2.0)
+            if udp_sock is not None:
+                udp_sock.close()
+            log_file_holder[0].close()
+            if ser.is_open:
+                ser.close()
 
         if user_exit:
             print("\r[uart_monitor] Disconnected.")
