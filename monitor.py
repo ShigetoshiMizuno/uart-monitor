@@ -142,7 +142,7 @@ def udp_thread(
         while not stop_event.is_set():
             try:
                 data, addr = udp_sock.recvfrom(4096)
-            except socket.timeout:
+            except (socket.timeout, ConnectionResetError, OSError):
                 continue
 
             last_udp_sender[0] = addr
