@@ -15,6 +15,8 @@ from pathlib import Path
 
 import serial
 
+__version__ = "1.0.0"
+
 RECONNECT_ATTEMPTS = 5
 RECONNECT_INTERVAL = 1.0
 
@@ -123,6 +125,7 @@ def new_log_path(log_format: str) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="UART共有モニタリングツール")
+    parser.add_argument("--version", action="version", version=f"uart_monitor {__version__}")
     parser.add_argument("--port", default="COM3", help="シリアルポート (default: COM3)")
     parser.add_argument("--baud", type=int, default=115200, help="ボーレート (default: 115200)")
     parser.add_argument(
